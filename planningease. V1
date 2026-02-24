@@ -1,0 +1,1197 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+
+// ─── Formatters ────────────────────────────────────────────────────────────────
+const fmt = (n, d = 0) => isNaN(n) || !isFinite(n) ? "—" : n.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+const fmtD = (n, d = 0) => isNaN(n) || !isFinite(n) ? "—" : `$${fmt(n, d)}`;
+const fmtP = (n) => isNaN(n) || !isFinite(n) ? "—" : `${fmt(n, 2)}%`;
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+// ─── Box-Muller ────────────────────────────────────────────────────────────────
+function randNormal(mean, sd) {
+  let u, v;
+  do { u = Math.random(); } while (u === 0);
+  do { v = Math.random(); } while (v === 0);
+  return mean + sd * Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+
+// ─── Asset classes ─────────────────────────────────────────────────────────────
+const ASSET_CLASSES = [
+  { key: "us",    label: "🇺🇸 US Stocks",       ret: 10.0, vol: 15.0, color: "#3fb950" },
+  { key: "intl",  label: "🌍 International",     ret: 8.0,  vol: 17.0, color: "#58a6ff" },
+  { key: "em",    label: "🌏 Emerging Markets",  ret: 9.0,  vol: 22.0, color: "#f0883e" },
+  { key: "bonds", label: "🏦 Bonds",             ret: 4.0,  vol: 6.0,  color: "#a371f7" },
+  { key: "reits", label: "🏠 REITs",             ret: 7.0,  vol: 18.0, color: "#e8c97a" },
+  { key: "cash",  label: "💵 Cash",              ret: 2.5,  vol: 0.5,  color: "#8b949e" },
+  { key: "comm",  label: "🪙 Commodities",       ret: 5.0,  vol: 20.0, color: "#ff7b72" },
+];
+
+const ASSET_EXPLAINERS = {
+  us:    "Large and small US-listed companies. Long-term growth engine but volatile short term.",
+  intl:  "Developed-market stocks outside the US (Europe, Japan, etc.). Diversifies currency risk.",
+  em:    "Stocks in faster-growing economies (India, China, Brazil). Higher risk, higher potential reward.",
+  bonds: "Government and corporate debt. Provides income and cushions stock market swings.",
+  reits: "Real-estate investment trusts. Inflation hedge with dividend income.",
+  cash:  "Money-market funds and short-term T-bills. Safe but loses ground to inflation over time.",
+  comm:  "Oil, gold, agriculture futures. Inflation hedge, but noisy and cyclical.",
+};
+
+const DEFAULT_ALLOC = { us: 40, intl: 20, em: 10, bonds: 20, reits: 5, cash: 2, comm: 3 };
+
+// ─── Quiz ──────────────────────────────────────────────────────────────────────
+const QUIZ = [
+  { q: "How long until you need this money?", opts: ["< 3 years", "3–7 years", "8–15 years", "> 15 years"], scores: [0,1,2,3] },
+  { q: "If your portfolio dropped 30%, you'd…", opts: ["Sell everything", "Sell some", "Hold steady", "Buy more"], scores: [0,1,2,3] },
+  { q: "Primary investment goal?", opts: ["Preserve capital", "Modest growth + income", "Balanced growth", "Maximum growth"], scores: [0,1,2,3] },
+  { q: "How stable is your income?", opts: ["Very unstable", "Somewhat unstable", "Mostly stable", "Very stable"], scores: [0,1,2,3] },
+];
+
+function riskProfile(score) {
+  if (score <= 3)  return { label: "Conservative",  color: "#58a6ff", alloc: { us:15, intl:5,  em:0,  bonds:55, reits:5, cash:15, comm:5 } };
+  if (score <= 6)  return { label: "Moderate",      color: "#3fb950", alloc: { us:30, intl:15, em:5,  bonds:35, reits:7, cash:5,  comm:3 } };
+  if (score <= 9)  return { label: "Growth",        color: "#e8c97a", alloc: { us:45, intl:20, em:10, bonds:15, reits:5, cash:2,  comm:3 } };
+  return               { label: "Aggressive",    color: "#f85149", alloc: { us:55, intl:20, em:15, bonds:5,  reits:3, cash:1,  comm:1 } };
+}
+
+// ─── Micro UI ──────────────────────────────────────────────────────────────────
+function CountUp({ value, prefix = "$", duration = 800 }) {
+  const [d, setD] = useState(0);
+  const raf = useRef(null);
+  useEffect(() => {
+    const end = isNaN(value) || !isFinite(value) ? 0 : value;
+    const s = d, t0 = performance.now();
+    const tick = now => {
+      const t = Math.min((now - t0) / duration, 1);
+      setD(Math.round(s + (end - s) * (1 - Math.pow(1 - t, 3))));
+      if (t < 1) raf.current = requestAnimationFrame(tick);
+    };
+    raf.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf.current);
+  }, [value]);
+  return <>{prefix}{d.toLocaleString()}</>;
+}
+
+function Tog({ options, value, onChange, small }) {
+  return (
+    <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom: small ? 8 : 14 }}>
+      {options.map(o => (
+        <button key={o.val} onClick={() => onChange(o.val)} style={{
+          padding: small ? "5px 11px" : "7px 15px", borderRadius:8,
+          border:`1px solid ${value===o.val?"#c9a84c":"#2a3444"}`,
+          background: value===o.val?"#c9a84c":"#1c2330",
+          color: value===o.val?"#0d1117":"#8b949e",
+          fontFamily:"inherit", fontSize: small?"0.76rem":"0.82rem", fontWeight:600, cursor:"pointer", transition:"all 0.15s"
+        }}>{o.label}</button>
+      ))}
+    </div>
+  );
+}
+
+function Panel({ title, emoji, children }) {
+  return (
+    <div style={{ background:"#161b22", border:"1px solid #2a3444", borderRadius:12, padding:22, marginBottom:18 }}>
+      {title && <div style={{ fontFamily:"'Playfair Display',serif", fontSize:"1rem", color:"#c9a84c", marginBottom:16, paddingBottom:10, borderBottom:"1px solid #2a3444" }}>
+        {emoji && <span style={{ marginRight:8 }}>{emoji}</span>}{title}
+      </div>}
+      {children}
+    </div>
+  );
+}
+
+function SecHeader({ children }) {
+  return (
+    <div style={{ display:"flex", alignItems:"center", gap:12, margin:"28px 0 14px", fontFamily:"'Playfair Display',serif", fontSize:"1.2rem", color:"#e6edf3" }}>
+      {children}<div style={{ flex:1, height:1, background:"#2a3444" }} />
+    </div>
+  );
+}
+
+function SliderInput({ label, value, onChange, min, max, step=1, format=v=>v, note, emoji }) {
+  return (
+    <div style={{ marginBottom:18 }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"baseline", marginBottom:5 }}>
+        <label style={{ fontSize:"0.78rem", fontWeight:500, color:"#8b949e", textTransform:"uppercase", letterSpacing:"0.05em" }}>
+          {emoji && <span style={{ marginRight:5 }}>{emoji}</span>}{label}
+        </label>
+        <span style={{ fontSize:"1rem", fontWeight:700, color:"#e8c97a" }}>{format(value)}</span>
+      </div>
+      <input type="range" min={min} max={max} step={step} value={value}
+        onChange={e => onChange(parseFloat(e.target.value))}
+        style={{ width:"100%", accentColor:"#c9a84c", cursor:"pointer" }} />
+      <div style={{ display:"flex", justifyContent:"space-between", fontSize:"0.67rem", color:"#3a4a5a", marginTop:3 }}>
+        <span>{format(min)}</span><span>{format(max)}</span>
+      </div>
+      {note && <p style={{ fontSize:"0.72rem", color:"#6a7a8a", marginTop:5, fontStyle:"italic", lineHeight:1.4 }}>{note}</p>}
+    </div>
+  );
+}
+
+function NumberInput({ label, value, onChange, note, emoji }) {
+  return (
+    <div style={{ marginBottom:18 }}>
+      <label style={{ display:"block", fontSize:"0.78rem", fontWeight:500, color:"#8b949e", textTransform:"uppercase", letterSpacing:"0.05em", marginBottom:6 }}>
+        {emoji && <span style={{ marginRight:5 }}>{emoji}</span>}{label}
+      </label>
+      <div style={{ display:"flex", alignItems:"center", background:"#1c2330", border:"1px solid #2a3444", borderRadius:8, overflow:"hidden" }}>
+        <span style={{ padding:"0 12px", color:"#8b949e", borderRight:"1px solid #2a3444", background:"#161b22", fontSize:"0.9rem" }}>$</span>
+        <input type="number" value={value||""} onChange={e => onChange(parseFloat(e.target.value)||0)}
+          placeholder="0"
+          style={{ background:"transparent", border:"none", color:"#e6edf3", padding:"10px 12px", fontSize:"0.95rem", fontFamily:"inherit", outline:"none", width:"100%" }} />
+      </div>
+      {note && <p style={{ fontSize:"0.72rem", color:"#6a7a8a", marginTop:5, fontStyle:"italic", lineHeight:1.4 }}>{note}</p>}
+    </div>
+  );
+}
+
+function ProgressRing({ pct, size=88, stroke=8, color="#3fb950", label, sublabel }) {
+  const r = (size-stroke)/2, circ = 2*Math.PI*r;
+  const off = circ - (clamp(pct,0,100)/100)*circ;
+  return (
+    <div style={{ textAlign:"center" }}>
+      <svg width={size} height={size}>
+        <circle cx={size/2} cy={size/2} r={r} fill="none" stroke="#2a3444" strokeWidth={stroke} />
+        <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={color} strokeWidth={stroke}
+          strokeDasharray={circ} strokeDashoffset={off} strokeLinecap="round"
+          transform={`rotate(-90 ${size/2} ${size/2})`} style={{ transition:"stroke-dashoffset 0.7s ease" }} />
+        <text x={size/2} y={size/2-3} textAnchor="middle" fill="#e6edf3" fontSize="13" fontWeight="700">{Math.round(pct)}%</text>
+        <text x={size/2} y={size/2+13} textAnchor="middle" fill="#8b949e" fontSize="8.5">{label}</text>
+      </svg>
+      {sublabel && <div style={{ fontSize:"0.68rem", color:"#8b949e", marginTop:3, lineHeight:1.3 }}>{sublabel}</div>}
+    </div>
+  );
+}
+
+function MoneyTree({ portfolioValue, targetAmount }) {
+  const pct = clamp(portfolioValue/Math.max(targetAmount,1)*100,0,100);
+  const tH = 55 + pct*0.5;
+  return (
+    <div style={{ textAlign:"center" }}>
+      <svg width="190" height="210" viewBox="0 0 190 210" style={{ overflow:"visible" }}>
+        <ellipse cx="95" cy="200" rx="50" ry="7" fill="#1a3a1a" opacity="0.6" />
+        <rect x="88" y={200-tH} width="14" height={tH} rx="7" fill="#5a3e1b" />
+        <path d={`M 95 ${200-tH*0.6} Q 60 ${200-tH*0.75} 50 ${200-tH*0.85}`} stroke="#5a3e1b" strokeWidth="6" fill="none" strokeLinecap="round" />
+        <path d={`M 95 ${200-tH*0.5} Q 130 ${200-tH*0.65} 140 ${200-tH*0.78}`} stroke="#5a3e1b" strokeWidth="5" fill="none" strokeLinecap="round" />
+        {[{cx:95,cy:200-tH-28,r:42,c:"#1a5c1a"},{cx:72,cy:200-tH-12,r:28,c:"#217a21"},{cx:118,cy:200-tH-14,r:26,c:"#217a21"},{cx:95,cy:200-tH-52,r:30,c:"#2ea82e"},{cx:50,cy:200-tH*0.82,r:18,c:"#1a7a1a"},{cx:140,cy:200-tH*0.75,r:17,c:"#1a7a1a"}].map((c,i)=>(
+          <circle key={i} cx={c.cx} cy={c.cy} r={c.r} fill={c.c} />
+        ))}
+        {pct>15&&<><circle cx="83" cy={200-tH-16} r="10" fill="#c9a84c" style={{animation:"coinFloat 2s ease-in-out infinite"}}/><text x="83" y={200-tH-12} textAnchor="middle" fontSize="10" fill="#1a1a00" fontWeight="bold">$</text></>}
+        {pct>35&&<><circle cx="110" cy={200-tH-32} r="10" fill="#c9a84c" style={{animation:"coinFloat 2.3s ease-in-out infinite 0.4s"}}/><text x="110" y={200-tH-28} textAnchor="middle" fontSize="10" fill="#1a1a00" fontWeight="bold">$</text></>}
+        {pct>55&&<><circle cx="95" cy={200-tH-57} r="10" fill="#c9a84c" style={{animation:"coinFloat 1.8s ease-in-out infinite 0.8s"}}/><text x="95" y={200-tH-53} textAnchor="middle" fontSize="10" fill="#1a1a00" fontWeight="bold">$</text></>}
+        {pct>75&&<><circle cx="50" cy={200-tH*0.82-4} r="9" fill="#e8c97a" style={{animation:"coinFloat 2.1s ease-in-out infinite 1.1s"}}/><text x="50" y={200-tH*0.82} textAnchor="middle" fontSize="9" fill="#1a1a00" fontWeight="bold">$</text><circle cx="140" cy={200-tH*0.75-4} r="9" fill="#e8c97a" style={{animation:"coinFloat 2.4s ease-in-out infinite 0.6s"}}/><text x="140" y={200-tH*0.75} textAnchor="middle" fontSize="9" fill="#1a1a00" fontWeight="bold">$</text></>}
+      </svg>
+      <div style={{ fontSize:"0.78rem", color:"#8b949e", marginTop:2 }}>
+        Nest egg is <strong style={{ color:"#3fb950" }}>{Math.round(pct)}%</strong> of goal
+      </div>
+    </div>
+  );
+}
+
+function LifeTimeline({ currentAge, retirementAge, lifeExpectancy, yearsToRetirement, yearsInRetirement }) {
+  const total = lifeExpectancy - currentAge;
+  const wP = (yearsToRetirement/total)*100, rP = (yearsInRetirement/total)*100;
+  return (
+    <div style={{ marginBottom:8 }}>
+      <div style={{ display:"flex", height:38, borderRadius:10, overflow:"hidden", border:"1px solid #2a3444" }}>
+        <div style={{ width:`${wP}%`, background:"linear-gradient(90deg,#1a4a6b,#2563a8)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:"0.72rem", color:"#fff", fontWeight:600, padding:"0 8px", transition:"width 0.5s", whiteSpace:"nowrap", overflow:"hidden" }}>
+          💼 {yearsToRetirement} yrs saving
+        </div>
+        <div style={{ width:`${rP}%`, background:"linear-gradient(90deg,#1a5c2a,#2ea82e)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:"0.72rem", color:"#fff", fontWeight:600, padding:"0 8px", transition:"width 0.5s", whiteSpace:"nowrap", overflow:"hidden" }}>
+          🌴 {yearsInRetirement} yrs retired
+        </div>
+      </div>
+      <div style={{ display:"flex", justifyContent:"space-between", fontSize:"0.68rem", color:"#8b949e", marginTop:5 }}>
+        <span>Age {currentAge}</span><span>🎉 Age {retirementAge}</span><span>Age {lifeExpectancy}</span>
+      </div>
+    </div>
+  );
+}
+
+// ─── Interactive Growth Chart ──────────────────────────────────────────────────
+function GrowthChart({ yearsToRetirement, yearsInRetirement, annualSavings, preReturn, postReturn, currentPortfolio, step2Result, currentAge, legacyFV, realRate, bigPurchases=[], inflation=3 }) {
+  const ref = useRef(null);
+  const stateRef = useRef({ points:[], dragging:false, dragStart:null, dragZoom:null, hovX:null });
+  const [tooltip, setTooltip] = useState(null);
+  const [zoomRange, setZoomRange] = useState(null);
+
+  const buildPoints = useCallback(() => {
+    const pts = [];
+    let bal = currentPortfolio;
+    const total = yearsToRetirement + yearsInRetirement;
+    const r_real = realRate/100;
+    const floor = legacyFV>0 ? legacyFV : 0;
+    for (let yr=0; yr<=total; yr++) {
+      if (yr >= yearsToRetirement) {
+        const retYr = yr - yearsToRetirement;
+        bigPurchases.forEach(p => {
+          if ((parseInt(p.year)||0) === retYr) {
+            const inflated = (parseFloat(p.amount)||0)*Math.pow(1+inflation/100, yearsToRetirement+retYr);
+            bal = Math.max(floor, bal-inflated);
+          }
+        });
+      }
+      pts.push({ yr, bal:Math.max(floor,bal), isBP: yr>=yearsToRetirement && bigPurchases.some(p=>(parseInt(p.year)||0)===yr-yearsToRetirement && p.amount>0) });
+      if (yr < yearsToRetirement) bal = bal*(1+preReturn/100)+Math.max(0,annualSavings);
+      else bal = Math.max(floor, bal*(1+r_real)-step2Result);
+    }
+    return pts;
+  }, [yearsToRetirement, yearsInRetirement, annualSavings, preReturn, currentPortfolio, step2Result, legacyFV, realRate, bigPurchases, inflation]);
+
+  const draw = useCallback((hovX, zr) => {
+    const canvas = ref.current; if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const W = canvas.width, H = canvas.height;
+    const pad = { top:40, right:24, bottom:64, left:80 };
+    const cW = W-pad.left-pad.right, cH = H-pad.top-pad.bottom;
+    ctx.clearRect(0,0,W,H);
+
+    const points = buildPoints();
+    const total = yearsToRetirement+yearsInRetirement;
+    stateRef.current.points = points;
+
+    const lo = zr?zr.lo:0, hi = zr?zr.hi:total;
+    const vis = points.filter(p=>p.yr>=lo&&p.yr<=hi);
+    if (vis.length<2) return;
+
+    const maxBal = Math.max(...vis.map(p=>p.bal),1);
+    const toX = yr => pad.left+((yr-lo)/(hi-lo))*cW;
+    const toY = b  => pad.top+cH-(Math.min(b,maxBal)/maxBal)*cH;
+
+    // Grid
+    [0.25,0.5,0.75,1].forEach(f=>{
+      const y = pad.top+cH*(1-f);
+      ctx.strokeStyle="#1c2330"; ctx.lineWidth=1;
+      ctx.beginPath(); ctx.moveTo(pad.left,y); ctx.lineTo(pad.left+cW,y); ctx.stroke();
+      const v = maxBal*f;
+      ctx.fillStyle="#4a5568"; ctx.font="13px sans-serif"; ctx.textAlign="right";
+      ctx.fillText(v>=1e6?`$${(v/1e6).toFixed(2)}M`:`$${Math.round(v/1000)}K`, pad.left-6, y+4);
+    });
+
+    // Year ticks
+    const span=hi-lo;
+    const tickStep = span<=10?1:span<=20?2:span<=40?5:10;
+    const firstTick = Math.ceil(lo/tickStep)*tickStep;
+    ctx.fillStyle="#4a5568"; ctx.font="13px sans-serif"; ctx.textAlign="center";
+    for (let yr=firstTick; yr<=hi; yr+=tickStep) {
+      const x=toX(yr);
+      ctx.strokeStyle="#1c2330"; ctx.lineWidth=1;
+      ctx.beginPath(); ctx.moveTo(x,pad.top); ctx.lineTo(x,pad.top+cH); ctx.stroke();
+      ctx.fillText(`Age ${currentAge+yr}`, x, H-pad.bottom+20);
+    }
+
+    // Retire line
+    if (yearsToRetirement>=lo&&yearsToRetirement<=hi) {
+      const rx=toX(yearsToRetirement);
+      ctx.strokeStyle="#c9a84c"; ctx.lineWidth=2; ctx.setLineDash([5,4]);
+      ctx.beginPath(); ctx.moveTo(rx,pad.top); ctx.lineTo(rx,pad.top+cH); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle="#c9a84c"; ctx.font="bold 18px sans-serif"; ctx.textAlign="center";
+      ctx.fillText("🎉 Retire", rx, pad.top-10);
+    }
+
+    // Fill areas
+    const fillArea=(pts,c1,c2)=>{
+      if(pts.length<2)return;
+      const g=ctx.createLinearGradient(0,pad.top,0,pad.top+cH);
+      g.addColorStop(0,c1); g.addColorStop(1,c2);
+      ctx.fillStyle=g; ctx.beginPath();
+      ctx.moveTo(toX(pts[0].yr),pad.top+cH);
+      pts.forEach(p=>ctx.lineTo(toX(p.yr),toY(p.bal)));
+      ctx.lineTo(toX(pts[pts.length-1].yr),pad.top+cH);
+      ctx.closePath(); ctx.fill();
+    };
+    const drawLine=(pts,color)=>{
+      if(pts.length<2)return;
+      ctx.strokeStyle=color; ctx.lineWidth=3; ctx.lineJoin="round"; ctx.lineCap="round";
+      ctx.beginPath(); pts.forEach((p,i)=>i===0?ctx.moveTo(toX(p.yr),toY(p.bal)):ctx.lineTo(toX(p.yr),toY(p.bal))); ctx.stroke();
+    };
+    const acc=vis.filter(p=>p.yr<=yearsToRetirement);
+    const sp=vis.filter(p=>p.yr>=yearsToRetirement);
+    fillArea(acc,"rgba(63,185,80,0.4)","rgba(63,185,80,0.03)");
+    fillArea(sp,"rgba(88,166,255,0.35)","rgba(88,166,255,0.03)");
+    drawLine(acc,"#3fb950"); drawLine(sp,"#58a6ff");
+
+    // Big purchase markers
+    points.filter(p=>p.isBP&&p.yr>=lo&&p.yr<=hi).forEach(p=>{
+      const px=toX(p.yr), py=toY(p.bal);
+      ctx.strokeStyle="rgba(240,136,62,0.6)"; ctx.lineWidth=2; ctx.setLineDash([4,3]);
+      ctx.beginPath(); ctx.moveTo(px,pad.top); ctx.lineTo(px,pad.top+cH); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.beginPath(); ctx.arc(px,py,7,0,Math.PI*2);
+      ctx.fillStyle="#f0883e"; ctx.fill(); ctx.strokeStyle="#fff"; ctx.lineWidth=2; ctx.stroke();
+      const bp=bigPurchases.find(b=>(parseInt(b.year)||0)===p.yr-yearsToRetirement);
+      if(bp){ ctx.fillStyle="#f0883e"; ctx.font="bold 14px sans-serif"; ctx.textAlign="center"; ctx.fillText(bp.label||"Purchase",px,pad.top-10); }
+    });
+
+    // Peak dot
+    const pk=points[yearsToRetirement];
+    if(pk&&pk.yr>=lo&&pk.yr<=hi){
+      ctx.beginPath(); ctx.arc(toX(pk.yr),toY(pk.bal),7,0,Math.PI*2);
+      ctx.fillStyle="#c9a84c"; ctx.fill(); ctx.strokeStyle="#fff"; ctx.lineWidth=2; ctx.stroke();
+    }
+
+    // Legacy floor
+    if(legacyFV>0&&legacyFV<maxBal){
+      const ly=toY(legacyFV);
+      ctx.strokeStyle="#a855f7"; ctx.lineWidth=1.5; ctx.setLineDash([4,3]);
+      const lx0=Math.max(toX(yearsToRetirement),pad.left);
+      ctx.beginPath(); ctx.moveTo(lx0,ly); ctx.lineTo(pad.left+cW,ly); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle="#a855f7"; ctx.font="12px sans-serif"; ctx.textAlign="left";
+      ctx.fillText(`🎁 ${legacyFV>=1e6?"$"+(legacyFV/1e6).toFixed(1)+"M":"$"+Math.round(legacyFV/1000)+"K"}`, lx0+4, ly-4);
+    }
+
+    // Legend
+    ctx.font="bold 16px sans-serif"; ctx.textAlign="left";
+    [[pad.left,H-8,"#3fb950","Growing 📈"],[pad.left+220,H-8,"#58a6ff","Spending 💸"],...(legacyFV>0?[[pad.left+440,H-8,"#a855f7","Legacy 🎁"]]:[])].forEach(([x,y,c,t])=>{
+      ctx.fillStyle=c; ctx.fillRect(x,y-16,18,16);
+      ctx.fillStyle="#c8d3de"; ctx.fillText(t,x+26,y);
+    });
+
+    // Zoom hint
+    if(zr){
+      ctx.fillStyle="rgba(201,168,76,0.55)"; ctx.font="11px sans-serif"; ctx.textAlign="right";
+      ctx.fillText("Scroll to zoom · Drag to pan · Dbl-click to reset", pad.left+cW, pad.top-14);
+    } else {
+      ctx.fillStyle="#3a4a5a"; ctx.font="11px sans-serif"; ctx.textAlign="right";
+      ctx.fillText("Scroll to zoom · Drag to pan", pad.left+cW, pad.top-14);
+    }
+
+    // Crosshair
+    if(hovX!==null){
+      const frac=(hovX-pad.left)/cW;
+      const yr=lo+frac*(hi-lo);
+      const nearest=points.reduce((b,p)=>Math.abs(p.yr-yr)<Math.abs(b.yr-yr)?p:b,points[0]);
+      if(nearest.yr>=lo&&nearest.yr<=hi){
+        const cx=toX(nearest.yr), cy=toY(nearest.bal);
+        ctx.strokeStyle="rgba(255,255,255,0.2)"; ctx.lineWidth=1; ctx.setLineDash([4,3]);
+        ctx.beginPath(); ctx.moveTo(cx,pad.top); ctx.lineTo(cx,pad.top+cH); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.beginPath(); ctx.arc(cx,cy,5,0,Math.PI*2);
+        ctx.fillStyle=nearest.yr<=yearsToRetirement?"#3fb950":"#58a6ff"; ctx.fill();
+        ctx.strokeStyle="#fff"; ctx.lineWidth=1.5; ctx.stroke();
+      }
+    }
+  }, [buildPoints, yearsToRetirement, yearsInRetirement, currentAge, legacyFV, bigPurchases]);
+
+  useEffect(() => { draw(stateRef.current.hovX, zoomRange); }, [draw, zoomRange]);
+
+  const getCanvasX = (e,canvas) => { const r=canvas.getBoundingClientRect(); return (e.clientX-r.left)*(canvas.width/r.width); };
+  const xToYear = (cx,zr) => {
+    const canvas=ref.current; if(!canvas) return 0;
+    const cW=canvas.width-80-24;
+    const total=yearsToRetirement+yearsInRetirement;
+    const lo=zr?zr.lo:0, hi=zr?zr.hi:total;
+    return lo+((cx-80)/cW)*(hi-lo);
+  };
+
+  const onWheel = e => {
+    e.preventDefault();
+    const canvas=ref.current; if(!canvas) return;
+    const total=yearsToRetirement+yearsInRetirement;
+    const zr=zoomRange||{lo:0,hi:total};
+    const pivot=xToYear(getCanvasX(e,canvas),zr);
+    const factor=e.deltaY>0?1.15:0.87;
+    let lo=pivot-(pivot-zr.lo)*factor, hi=pivot+(zr.hi-pivot)*factor;
+    lo=Math.max(0,lo); hi=Math.min(total,hi);
+    if(hi-lo<1)return;
+    const nz={lo,hi}; setZoomRange(nz); draw(stateRef.current.hovX,nz);
+  };
+
+  const onMouseMove = e => {
+    const canvas=ref.current; if(!canvas) return;
+    const pad={left:80,top:40,bottom:64,right:24};
+    const cW=canvas.width-pad.left-pad.right;
+    const r=canvas.getBoundingClientRect();
+    const scX=canvas.width/r.width;
+    const cx=(e.clientX-r.left)*scX;
+    const cy=(e.clientY-r.top)*(canvas.height/r.height);
+
+    if(stateRef.current.dragging&&stateRef.current.dragStart!==null){
+      const total=yearsToRetirement+yearsInRetirement;
+      const dz=stateRef.current.dragZoom||{lo:0,hi:total};
+      const span=dz.hi-dz.lo;
+      const dyrs=-(cx-stateRef.current.dragStart)/cW*span;
+      let lo=dz.lo+dyrs, hi=dz.hi+dyrs;
+      if(lo<0){hi-=lo;lo=0;} if(hi>total){lo-=(hi-total);hi=total;}
+      lo=Math.max(0,lo); hi=Math.min(total,hi);
+      const nz={lo,hi}; setZoomRange(nz); stateRef.current.hovX=cx; draw(cx,nz); return;
+    }
+
+    if(cx<pad.left||cx>pad.left+cW||cy<pad.top||cy>pad.top+(canvas.height-pad.top-pad.bottom)){
+      stateRef.current.hovX=null; setTooltip(null); draw(null,zoomRange); return;
+    }
+    stateRef.current.hovX=cx; draw(cx,zoomRange);
+
+    const total=yearsToRetirement+yearsInRetirement;
+    const yr=xToYear(cx,zoomRange);
+    const pts=stateRef.current.points;
+    if(!pts.length)return;
+    const nearest=pts.reduce((b,p)=>Math.abs(p.yr-yr)<Math.abs(b.yr-yr)?p:b,pts[0]);
+    const phase=nearest.yr<yearsToRetirement?"Growing 📈":nearest.yr===yearsToRetirement?"🎉 Retirement Day":"Spending 💸";
+    setTooltip({ x:e.clientX, y:e.clientY, yr:nearest.yr, age:currentAge+nearest.yr, bal:nearest.bal, phase });
+  };
+
+  const onMouseDown = e => {
+    const canvas=ref.current; if(!canvas) return;
+    const total=yearsToRetirement+yearsInRetirement;
+    stateRef.current.dragging=true;
+    stateRef.current.dragStart=getCanvasX(e,canvas);
+    stateRef.current.dragZoom=zoomRange||{lo:0,hi:total};
+    canvas.style.cursor="grabbing";
+  };
+  const onMouseUp = () => { stateRef.current.dragging=false; stateRef.current.dragStart=null; if(ref.current)ref.current.style.cursor="crosshair"; };
+  const onMouseLeave = () => { stateRef.current.hovX=null; stateRef.current.dragging=false; setTooltip(null); draw(null,zoomRange); if(ref.current)ref.current.style.cursor="crosshair"; };
+  const onDblClick = () => { setZoomRange(null); draw(null,null); };
+
+  return (
+    <div style={{ position:"relative", userSelect:"none" }}>
+      <canvas ref={ref} width={1400} height={600}
+        style={{ width:"100%", height:"auto", display:"block", cursor:"crosshair", borderRadius:8 }}
+        onWheel={onWheel} onMouseMove={onMouseMove} onMouseDown={onMouseDown}
+        onMouseUp={onMouseUp} onMouseLeave={onMouseLeave} onDoubleClick={onDblClick}
+      />
+      {tooltip && (
+        <div style={{ position:"fixed", left:tooltip.x+14, top:tooltip.y-70, background:"rgba(13,17,23,0.97)", border:`1px solid ${tooltip.yr<=yearsToRetirement?"#3fb950":"#58a6ff"}`, borderRadius:10, padding:"10px 14px", pointerEvents:"none", zIndex:999, boxShadow:"0 4px 24px rgba(0,0,0,0.5)", minWidth:180 }}>
+          <div style={{ fontSize:"0.7rem", color:"#8b949e", textTransform:"uppercase", letterSpacing:"0.08em", marginBottom:4 }}>{tooltip.phase}</div>
+          <div style={{ fontFamily:"'Playfair Display',serif", fontSize:"1.2rem", fontWeight:700, color:tooltip.yr<=yearsToRetirement?"#3fb950":"#58a6ff", marginBottom:2 }}>
+            {tooltip.bal>=1e6?`$${(tooltip.bal/1e6).toFixed(3)}M`:`$${Math.round(tooltip.bal/1000)}K`}
+          </div>
+          <div style={{ fontSize:"0.78rem", color:"#e6edf3" }}>Age <strong>{tooltip.age}</strong> · Year {tooltip.yr}</div>
+          {tooltip.yr===yearsToRetirement&&<div style={{ fontSize:"0.7rem", color:"#c9a84c", marginTop:4 }}>🏆 Peak portfolio value</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SpendingBuckets({ ssAdjusted, totalNeed }) {
+  const ssH=Math.max((ssAdjusted/Math.max(totalNeed,1))*110,8);
+  const savH=Math.max(((totalNeed-ssAdjusted)/Math.max(totalNeed,1))*110,8);
+  return (
+    <div style={{ display:"flex", gap:20, alignItems:"flex-end", justifyContent:"center", padding:"12px 0 8px" }}>
+      {[{icon:"🏛️",color1:"#2563a8",color2:"#1a3a6b",h:ssH,val:fmtD(ssAdjusted),label:"Social\nSecurity",tag:"SS"},
+        {icon:"+",plain:true},
+        {icon:"💼",color1:"#2ea82e",color2:"#1a5c1a",h:savH,val:fmtD(Math.max(totalNeed-ssAdjusted,0)),label:"Your\nSavings",tag:"Portfolio"},
+        {icon:"=",plain:true},
+        {icon:"🌴",color1:"#c9a84c",color2:"#7a5c1a",h:115,val:fmtD(totalNeed),label:"Annual\nIncome",tag:"Total",gold:true},
+      ].map((b,i)=>b.plain?(
+        <div key={i} style={{fontSize:"1.6rem",color:"#4a5568",paddingBottom:40}}>{b.icon}</div>
+      ):(
+        <div key={i} style={{textAlign:"center"}}>
+          <div style={{fontSize:"1.5rem",marginBottom:4}}>{b.icon}</div>
+          <div style={{width:72,height:b.h,background:`linear-gradient(180deg,${b.color1},${b.color2})`,borderRadius:"8px 8px 0 0",border:`2px solid ${b.color1}`,display:"flex",alignItems:"flex-start",justifyContent:"center",paddingTop:6,color:"#fff",fontSize:"0.68rem",fontWeight:700,transition:"height 0.5s ease",overflow:"hidden"}}>{b.tag}</div>
+          <div style={{background:b.color2,border:`2px solid ${b.color1}`,borderTop:0,width:72,padding:"4px 2px",fontSize:"0.62rem",color:b.gold?"#e8c97a":"#aaa",fontWeight:700,borderRadius:"0 0 6px 6px",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{b.val}/yr</div>
+          <div style={{fontSize:"0.65rem",color:"#8b949e",marginTop:5,whiteSpace:"pre-line",lineHeight:1.3}}>{b.label}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ─── Fan Chart (Monte Carlo) ───────────────────────────────────────────────────
+function FanChart({ simResults, years, currentAge, retirementAge, yearsToRetirement, mode }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    if(!simResults||simResults.length===0)return;
+    const canvas=ref.current; if(!canvas)return;
+    const ctx=canvas.getContext("2d");
+    const W=canvas.width, H=canvas.height;
+    const pad={top:28,right:20,bottom:52,left:68};
+    const cW=W-pad.left-pad.right, cH=H-pad.top-pad.bottom;
+    ctx.clearRect(0,0,W,H);
+    const pctAt=(yr,pcts)=>{const col=simResults.map(s=>s[yr]??0).sort((a,b)=>a-b); return pcts.map(p=>col[Math.floor((p/100)*(col.length-1))]);};
+    const totalYrs=years;
+    const maxVal=Math.max(...simResults.map(s=>Math.max(...s)),1);
+    const toX=yr=>pad.left+(yr/totalYrs)*cW;
+    const toY=v=>pad.top+cH-(Math.min(v,maxVal)/maxVal)*cH;
+    [0.25,0.5,0.75,1].forEach(f=>{
+      const y=pad.top+cH*(1-f);
+      ctx.strokeStyle="#1c2330"; ctx.lineWidth=1;
+      ctx.beginPath(); ctx.moveTo(pad.left,y); ctx.lineTo(pad.left+cW,y); ctx.stroke();
+      const v=maxVal*f;
+      ctx.fillStyle="#4a5568"; ctx.font="10px sans-serif"; ctx.textAlign="right";
+      ctx.fillText(v>=1e6?`$${(v/1e6).toFixed(1)}M`:`$${Math.round(v/1000)}K`,pad.left-5,y+4);
+    });
+    if(mode==="combined"&&yearsToRetirement<totalYrs){
+      const rx=toX(yearsToRetirement);
+      ctx.strokeStyle="#c9a84c"; ctx.lineWidth=1.5; ctx.setLineDash([5,4]);
+      ctx.beginPath(); ctx.moveTo(rx,pad.top); ctx.lineTo(rx,pad.top+cH); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle="#c9a84c"; ctx.font="bold 10px sans-serif"; ctx.textAlign="center";
+      ctx.fillText("🎉 Retire",rx,pad.top-8);
+    }
+    const bands=[{lo:10,hi:90,color:"rgba(63,185,80,0.12)"},{lo:25,hi:75,color:"rgba(63,185,80,0.22)"},{lo:40,hi:60,color:"rgba(63,185,80,0.35)"}];
+    const yrArr=Array.from({length:totalYrs+1},(_,i)=>i);
+    bands.forEach(({lo,hi,color})=>{
+      ctx.fillStyle=color; ctx.beginPath();
+      ctx.moveTo(toX(0),toY(pctAt(0,[lo])[0]));
+      yrArr.forEach(yr=>ctx.lineTo(toX(yr),toY(pctAt(yr,[lo])[0])));
+      [...yrArr].reverse().forEach(yr=>ctx.lineTo(toX(yr),toY(pctAt(yr,[hi])[0])));
+      ctx.closePath(); ctx.fill();
+    });
+    ctx.strokeStyle="#3fb950"; ctx.lineWidth=2.5; ctx.lineJoin="round";
+    ctx.beginPath();
+    yrArr.forEach((yr,i)=>{const m=pctAt(yr,[50])[0]; i===0?ctx.moveTo(toX(yr),toY(m)):ctx.lineTo(toX(yr),toY(m));});
+    ctx.stroke();
+    ctx.fillStyle="#4a5568"; ctx.font="10px sans-serif"; ctx.textAlign="center";
+    [0,0.25,0.5,0.75,1].map(f=>Math.round(f*totalYrs)).forEach(yr=>{ctx.fillText(`Age ${currentAge+yr}`,toX(yr),H-pad.bottom+18);});
+    ctx.font="11px sans-serif"; ctx.textAlign="left";
+    [["#3fb950","Median"],["rgba(63,185,80,0.35)","Middle 20%"],["rgba(63,185,80,0.22)","Middle 50%"],["rgba(63,185,80,0.12)","10th–90th"]].forEach(([c,t],i)=>{
+      ctx.fillStyle=c; ctx.fillRect(pad.left+i*140,H-pad.bottom+30,12,9);
+      ctx.fillStyle="#8b949e"; ctx.fillText(t,pad.left+i*140+16,H-pad.bottom+39);
+    });
+  },[simResults,years,currentAge,retirementAge,yearsToRetirement,mode]);
+  return <canvas ref={ref} width={580} height={280} style={{width:"100%",height:"auto",display:"block"}}/>;
+}
+
+function SuccessGauge({ pct }) {
+  const color=pct>=90?"#3fb950":pct>=75?"#e8c97a":pct>=60?"#f0883e":"#f85149";
+  const label=pct>=90?"Excellent 🟢":pct>=75?"Good 🟡":pct>=60?"Caution 🟠":"At Risk 🔴";
+  const r=52, circ=Math.PI*r;
+  const off=circ-(clamp(pct,0,100)/100)*circ;
+  return (
+    <div style={{textAlign:"center"}}>
+      <svg width="140" height="80" viewBox="0 0 140 80">
+        <path d="M 14 74 A 56 56 0 0 1 126 74" fill="none" stroke="#2a3444" strokeWidth="10" strokeLinecap="round"/>
+        <path d="M 14 74 A 56 56 0 0 1 126 74" fill="none" stroke={color} strokeWidth="10" strokeLinecap="round"
+          strokeDasharray={circ} strokeDashoffset={off} style={{transition:"stroke-dashoffset 1s ease,stroke 0.5s"}}/>
+        <text x="70" y="62" textAnchor="middle" fill={color} fontSize="20" fontWeight="900">{Math.round(pct)}%</text>
+        <text x="70" y="76" textAnchor="middle" fill="#8b949e" fontSize="8.5">Success Rate</text>
+      </svg>
+      <div style={{fontSize:"0.8rem",fontWeight:700,color,marginTop:2}}>{label}</div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// RETIREMENT TAB
+// ══════════════════════════════════════════════════════════════════════════════
+function RetirementTab() {
+  const [currentAge,setCurrentAge]=useState(35);
+  const [retirementAge,setRetirementAge]=useState(65);
+  const [lifeExpectancy,setLifeExpectancy]=useState(90);
+  const [preRetirementIncome,setPRI]=useState(100000);
+  const [wageReplacementRatio,setWRR]=useState(80);
+  const [incomeMode,setIncomeMode]=useState("calculate");
+  const [directRetirementIncome,setDRI]=useState(70000);
+  const [inflation,setInflation]=useState(3);
+  const [preRetirementReturn,setPRR]=useState(7);
+  const [postRetirementReturn,setPoRR]=useState(5);
+  const [socialSecurity,setSS]=useState(20000);
+  const [ssTiming,setSSTiming]=useState("FRA");
+  const [portfolioValue,setPV]=useState(50000);
+  const [inheritanceAmount,setIA]=useState(0);
+  const [inheritanceYears,setIY]=useState(10);
+  const [taxToggle,setTaxToggle]=useState("after");
+  const [taxRate,setTaxRate]=useState(22);
+  const [expenses,setExpenses]=useState([
+    {id:1,label:"Travel",amount:5000,type:"increase"},
+    {id:2,label:"College / Kids",amount:3000,type:"decrease"},
+  ]);
+  const [legacyItems,setLegacyItems]=useState([]);
+  const [bigPurchases,setBigPurchases]=useState([]);
+
+  const addExp=()=>setExpenses(p=>[...p,{id:Date.now(),label:"",amount:0,type:"increase"}]);
+  const remExp=id=>setExpenses(p=>p.filter(e=>e.id!==id));
+  const updExp=(id,f,v)=>setExpenses(p=>p.map(e=>e.id===id?{...e,[f]:v}:e));
+  const addLeg=()=>setLegacyItems(p=>[...p,{id:Date.now(),label:"",amount:0}]);
+  const remLeg=id=>setLegacyItems(p=>p.filter(e=>e.id!==id));
+  const updLeg=(id,f,v)=>setLegacyItems(p=>p.map(e=>e.id===id?{...e,[f]:v}:e));
+  const addBP=()=>setBigPurchases(p=>[...p,{id:Date.now(),label:"",amount:0,year:1}]);
+  const remBP=id=>setBigPurchases(p=>p.filter(e=>e.id!==id));
+  const updBP=(id,f,v)=>setBigPurchases(p=>p.map(e=>e.id===id?{...e,[f]:v}:e));
+
+  const ytr=Math.max(retirementAge-currentAge,1);
+  const yir=Math.max(lifeExpectancy-retirementAge,1);
+  const ssAdj=ssTiming==="62"?socialSecurity*0.7:ssTiming==="70"?socialSecurity*1.24:socialSecurity;
+  const netDelta=expenses.reduce((s,e)=>s+(e.type==="increase"?e.amount:-e.amount),0);
+  const grossNeed=incomeMode==="direct"?directRetirementIncome:preRetirementIncome*(wageReplacementRatio/100);
+  const totalNeedToday=grossNeed-ssAdj+netDelta;
+  const step1=taxToggle==="pre"?totalNeedToday/(1-taxRate/100):totalNeedToday;
+  const step2=step1*Math.pow(1+inflation/100,ytr);
+  const realRate=((1+postRetirementReturn/100)/(1+inflation/100)-1)*100;
+  const r3=realRate/100;
+  const legacyFV=legacyItems.reduce((s,e)=>s+(parseFloat(e.amount)||0),0);
+  const totalBPpv=bigPurchases.reduce((s,p)=>{
+    const fv=(parseFloat(p.amount)||0)*Math.pow(1+inflation/100,ytr+(parseInt(p.year)||0));
+    return s+fv/Math.pow(1+r3,(parseInt(p.year)||0));
+  },0);
+  const step3=(()=>{
+    const pvPay=r3===0?step2*yir:step2*((1-Math.pow(1+r3,-yir))/r3)*(1+r3);
+    const pvLeg=legacyFV/Math.pow(1+r3,yir);
+    return pvPay+pvLeg+totalBPpv;
+  })();
+  const pvInh=inheritanceAmount>0?inheritanceAmount/Math.pow(1+preRetirementReturn/100,inheritanceYears):0;
+  const combinedPV=portfolioValue+pvInh;
+  const r4=preRetirementReturn/100;
+  const fvF=Math.pow(1+r4,ytr);
+  const step4=r4===0?(step3-combinedPV)/ytr:((step3-combinedPV*fvF)*r4)/(fvF-1);
+  const savRate=preRetirementIncome>0?(step4/preRetirementIncome)*100:0;
+  const fundedPct=(combinedPV/Math.max(step3,1))*100;
+  const ssCovPct=(ssAdj/Math.max(step1,1))*100;
+  const srColor=savRate>25?"#f85149":savRate>15?"#e8c97a":"#3fb950";
+  const g2={display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(320px,1fr))",gap:18};
+
+  return (
+    <div style={{maxWidth:1100,margin:"0 auto",padding:"20px 16px 60px"}}>
+      <div style={{textAlign:"center",padding:"28px 0 20px"}}>
+        <div style={{fontSize:"2.6rem",marginBottom:8}}>🌱</div>
+        <h2 style={{fontFamily:"'Playfair Display',serif",fontSize:"clamp(1.8rem,5vw,2.8rem)",fontWeight:900,background:"linear-gradient(135deg,#e8c97a,#c9a84c,#8a6020)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent",backgroundClip:"text",lineHeight:1.1,marginBottom:8}}>
+          Retirement Planner
+        </h2>
+        <p style={{color:"#8b949e",fontSize:"0.9rem",maxWidth:460,margin:"0 auto"}}>Drag the sliders and watch your retirement picture come to life.</p>
+      </div>
+
+      <Panel title="Your Life at a Glance" emoji="📅">
+        <LifeTimeline currentAge={currentAge} retirementAge={retirementAge} lifeExpectancy={lifeExpectancy} yearsToRetirement={ytr} yearsInRetirement={yir}/>
+        <p style={{fontSize:"0.8rem",color:"#8b949e",marginTop:10,textAlign:"center"}}>
+          You have <strong style={{color:"#e8c97a"}}>{ytr} years</strong> to grow your savings. Your money supports you for <strong style={{color:"#3fb950"}}>{yir} years</strong> in retirement.
+        </p>
+      </Panel>
+
+      <SecHeader>⚙️ Tell Us About You</SecHeader>
+      <div style={g2}>
+        <Panel title="Age & Timeline" emoji="🗓️">
+          <SliderInput emoji="🎂" label="Your Age Today" value={currentAge} onChange={setCurrentAge} min={18} max={70} format={v=>`${v} yrs`}/>
+          <SliderInput emoji="🏖️" label="When Do You Want to Retire?" value={retirementAge} onChange={v=>v>currentAge&&setRetirementAge(v)} min={50} max={75} format={v=>`Age ${v}`}/>
+          <SliderInput emoji="⌛" label="How Long Will You Live?" value={lifeExpectancy} onChange={v=>v>retirementAge&&setLifeExpectancy(v)} min={65} max={100} format={v=>`Age ${v}`} note="Plan conservatively — many people live longer than expected."/>
+        </Panel>
+
+        <Panel title="Income & Lifestyle" emoji="💵">
+          <NumberInput emoji="💰" label="What Do You Earn Per Year?" value={preRetirementIncome} onChange={setPRI}/>
+          <div style={{marginBottom:18}}>
+            <label style={{display:"block",fontSize:"0.78rem",fontWeight:500,color:"#8b949e",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:8}}>🏡 Retirement Income Method</label>
+            <Tog options={[{val:"calculate",label:"📊 Calculate for Me"},{val:"direct",label:"✏️ I'll Enter It"}]} value={incomeMode} onChange={setIncomeMode}/>
+            {incomeMode==="calculate"
+              ?<SliderInput label="Replacement Ratio" value={wageReplacementRatio} onChange={setWRR} min={50} max={100} format={v=>`${v}%`} note={`That's ${fmtD(preRetirementIncome*wageReplacementRatio/100)}/year`}/>
+              :<NumberInput label="Annual Retirement Income" value={directRetirementIncome} onChange={setDRI} note="In today's dollars."/>}
+          </div>
+          <div>
+            <label style={{display:"block",fontSize:"0.78rem",fontWeight:500,color:"#8b949e",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:8}}>🧾 Before or After Taxes?</label>
+            <Tog options={[{val:"after",label:"✅ After-Tax"},{val:"pre",label:"📋 Pre-Tax"}]} value={taxToggle} onChange={setTaxToggle}/>
+            {taxToggle==="pre"&&<SliderInput label="Tax Rate in Retirement" value={taxRate} onChange={setTaxRate} min={10} max={45} format={v=>`${v}%`}/>}
+          </div>
+        </Panel>
+
+        <Panel title="Market & Inflation" emoji="📈">
+          <SliderInput emoji="💹" label="Inflation" value={inflation} onChange={setInflation} min={1} max={8} step={0.25} format={v=>`${v}%`} note={`Prices double every ~${Math.round(72/inflation)} years.`}/>
+          <SliderInput emoji="🚀" label="Return While Working" value={preRetirementReturn} onChange={setPRR} min={1} max={15} step={0.25} format={v=>`${v}%`}/>
+          <SliderInput emoji="🛡️" label="Return in Retirement" value={postRetirementReturn} onChange={setPoRR} min={1} max={12} step={0.25} format={v=>`${v}%`}/>
+          <div style={{background:"#0d1117",borderRadius:8,padding:"9px 14px",fontSize:"0.8rem",color:"#8b949e"}}>
+            📐 Real return in retirement: <strong style={{color:"#e8c97a"}}>{fmtP(realRate)}</strong>
+          </div>
+        </Panel>
+
+        <Panel title="Social Security" emoji="🏛️">
+          <NumberInput emoji="📬" label="Estimated Annual SS Benefit" value={socialSecurity} onChange={setSS} note="Find your estimate at ssa.gov."/>
+          <div>
+            <label style={{display:"block",fontSize:"0.78rem",fontWeight:500,color:"#8b949e",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:8}}>⏰ When Will You Claim?</label>
+            <Tog options={[{val:"62",label:"Early (62)"},{val:"FRA",label:"Full (67)"},{val:"70",label:"Delayed (70)"}]} value={ssTiming} onChange={setSSTiming}/>
+            <div style={{background:"#0d1117",borderRadius:8,padding:"10px 14px",fontSize:"0.82rem"}}>
+              {ssTiming==="62"&&<span style={{color:"#f85149"}}>⚠️ Claiming at 62 reduces your benefit by ~30%.</span>}
+              {ssTiming==="FRA"&&<span style={{color:"#3fb950"}}>✅ Full benefit at age 67.</span>}
+              {ssTiming==="70"&&<span style={{color:"#58a6ff"}}>🎯 Waiting until 70 boosts your benefit by ~24%!</span>}
+              <br/><span style={{color:"#8b949e"}}>Adjusted benefit: </span><strong style={{color:"#58a6ff"}}>{fmtD(ssAdj)}/year</strong>
+            </div>
+          </div>
+        </Panel>
+
+        <Panel title="Current Savings" emoji="🏦">
+          <NumberInput emoji="💼" label="Total Saved Already?" value={portfolioValue} onChange={setPV} note="401(k), IRA, brokerage, savings, etc."/>
+          <NumberInput emoji="🎁" label="Expected Inheritance?" value={inheritanceAmount} onChange={setIA} note="Optional. Today's dollars."/>
+          {inheritanceAmount>0&&<SliderInput emoji="📅" label="Years Until You Receive It" value={inheritanceYears} onChange={setIY} min={1} max={40} format={v=>`${v} yrs`} note={`Today's value: ${fmtD(pvInh)}`}/>}
+        </Panel>
+
+        <Panel title="Expense Changes in Retirement" emoji="🧾">
+          <p style={{fontSize:"0.8rem",color:"#8b949e",marginBottom:14,lineHeight:1.5}}>Costs that go <span style={{color:"#f85149"}}>up ▲</span> or <span style={{color:"#3fb950"}}>down ▼</span> in retirement.</p>
+          {expenses.map(e=>(
+            <div key={e.id} style={{display:"grid",gridTemplateColumns:"1fr 80px 120px 32px",gap:8,marginBottom:8,alignItems:"center"}}>
+              <input type="text" placeholder="e.g. Travel" value={e.label} onChange={ev=>updExp(e.id,"label",ev.target.value)} style={{background:"#1c2330",border:"1px solid #2a3444",borderRadius:8,color:"#e6edf3",padding:"8px 10px",fontFamily:"inherit",fontSize:"0.83rem",outline:"none"}}/>
+              <input type="number" value={e.amount||""} onChange={ev=>updExp(e.id,"amount",parseFloat(ev.target.value)||0)} placeholder="0" style={{background:"#1c2330",border:"1px solid #2a3444",borderRadius:8,color:"#e6edf3",padding:"8px 8px",fontFamily:"inherit",fontSize:"0.83rem",outline:"none"}}/>
+              <select value={e.type} onChange={ev=>updExp(e.id,"type",ev.target.value)} style={{background:"#1c2330",border:"1px solid #2a3444",borderRadius:8,color:e.type==="increase"?"#f85149":"#3fb950",padding:"8px 8px",fontFamily:"inherit",fontSize:"0.83rem",outline:"none"}}>
+                <option value="increase">▲ Goes Up</option>
+                <option value="decrease">▼ Goes Down</option>
+              </select>
+              <button onClick={()=>remExp(e.id)} style={{width:32,height:32,borderRadius:6,border:"1px solid #2a3444",background:"transparent",color:"#f85149",cursor:"pointer",fontSize:"1rem"}}>×</button>
+            </div>
+          ))}
+          <button onClick={addExp} style={{padding:"7px 14px",borderRadius:8,border:"1px dashed #2a3444",background:"transparent",color:"#8b949e",fontFamily:"inherit",fontSize:"0.8rem",cursor:"pointer",marginTop:4}}>+ Add Item</button>
+        </Panel>
+
+        <Panel title="Big Purchases in Retirement" emoji="🛒">
+          <p style={{fontSize:"0.8rem",color:"#8b949e",marginBottom:14,lineHeight:1.5}}>
+            One-time purchases outside your annual budget — a boat, car, vacation home, renovation, etc. Enter in today's dollars and we'll inflate them to the year of purchase.
+          </p>
+          {bigPurchases.length===0&&<div style={{textAlign:"center",padding:"16px 0",color:"#4a5568",fontSize:"0.82rem"}}>No big purchases planned yet.</div>}
+          {bigPurchases.length>0&&(
+            <div style={{display:"grid",gridTemplateColumns:"1fr 110px 90px 32px",gap:8,marginBottom:6}}>
+              {["What is it?","Amount (today's $)","Yr into Ret.",""].map(h=><span key={h} style={{fontSize:"0.65rem",color:"#4a5568",textTransform:"uppercase"}}>{h}</span>)}
+            </div>
+          )}
+          {bigPurchases.map(p=>(
+            <div key={p.id} style={{display:"grid",gridTemplateColumns:"1fr 110px 90px 32px",gap:8,marginBottom:8,alignItems:"center"}}>
+              <input type="text" placeholder="e.g. 🚤 Boat" value={p.label} onChange={ev=>updBP(p.id,"label",ev.target.value)} style={{background:"#1c2330",border:"1px solid #2a3444",borderRadius:8,color:"#e6edf3",padding:"8px 10px",fontFamily:"inherit",fontSize:"0.83rem",outline:"none"}}/>
+              <div style={{display:"flex",alignItems:"center",background:"#1c2330",border:"1px solid #2a3444",borderRadius:8,overflow:"hidden"}}>
+                <span style={{padding:"0 8px",color:"#8b949e",borderRight:"1px solid #2a3444",background:"#161b22",fontSize:"0.85rem"}}>$</span>
+                <input type="number" value={p.amount||""} onChange={ev=>updBP(p.id,"amount",parseFloat(ev.target.value)||0)} placeholder="0" style={{background:"transparent",border:"none",color:"#e6edf3",padding:"8px 8px",fontFamily:"inherit",fontSize:"0.83rem",outline:"none",width:"100%"}}/>
+              </div>
+              <input type="number" value={p.year||""} onChange={ev=>updBP(p.id,"year",parseInt(ev.target.value)||0)} placeholder="e.g. 5" min={0} style={{background:"#1c2330",border:"1px solid #2a3444",borderRadius:8,color:"#e8c97a",padding:"8px 10px",fontFamily:"inherit",fontSize:"0.83rem",outline:"none",textAlign:"center"}}/>
+              <button onClick={()=>remBP(p.id)} style={{width:32,height:32,borderRadius:6,border:"1px solid #2a3444",background:"transparent",color:"#f85149",cursor:"pointer",fontSize:"1rem"}}>×</button>
+            </div>
+          ))}
+          <button onClick={addBP} style={{padding:"7px 14px",borderRadius:8,border:"1px dashed #f0883e",background:"transparent",color:"#f0883e",fontFamily:"inherit",fontSize:"0.8rem",cursor:"pointer",marginTop:4}}>+ Add Purchase</button>
+          {bigPurchases.length>0&&(()=>{
+            const total=bigPurchases.reduce((s,p)=>{
+              const inflated=(parseFloat(p.amount)||0)*Math.pow(1+inflation/100,ytr+(parseInt(p.year)||0));
+              return s+inflated;
+            },0);
+            return (
+              <div style={{marginTop:12,background:"rgba(240,136,62,0.08)",border:"1px solid rgba(240,136,62,0.25)",borderRadius:8,padding:"10px 14px",fontSize:"0.82rem"}}>
+                <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+                  {bigPurchases.filter(p=>p.amount>0).map(p=>{
+                    const inflated=(parseFloat(p.amount)||0)*Math.pow(1+inflation/100,ytr+(parseInt(p.year)||0));
+                    return <div key={p.id} style={{fontSize:"0.75rem",color:"#8b949e"}}>{p.label||"Purchase"} <span style={{color:"#f0883e",fontWeight:600}}>({fmtD(inflated)} in {parseInt(p.year)||0} yrs)</span></div>;
+                  })}
+                </div>
+                <div style={{marginTop:8,display:"flex",justifyContent:"space-between",borderTop:"1px solid rgba(240,136,62,0.2)",paddingTop:8}}>
+                  <span style={{color:"#8b949e"}}>Total (future dollars)</span>
+                  <strong style={{color:"#f0883e"}}>{fmtD(total)}</strong>
+                </div>
+                <p style={{fontSize:"0.7rem",color:"#6a7a8a",marginTop:6,fontStyle:"italic"}}>Added to your nest egg goal on top of annual withdrawals.</p>
+              </div>
+            );
+          })()}
+        </Panel>
+
+        <Panel title="Legacy Goals" emoji="🎁">
+          <p style={{fontSize:"0.8rem",color:"#8b949e",marginBottom:14,lineHeight:1.5}}>Money you want to leave behind. Enter in today's dollars.</p>
+          {legacyItems.length===0&&<div style={{textAlign:"center",padding:"16px 0",color:"#4a5568",fontSize:"0.82rem"}}>No legacy goal set.</div>}
+          {legacyItems.map(e=>(
+            <div key={e.id} style={{display:"grid",gridTemplateColumns:"1fr 110px 32px",gap:8,marginBottom:8,alignItems:"center"}}>
+              <input type="text" placeholder="e.g. Kids, Charity" value={e.label} onChange={ev=>updLeg(e.id,"label",ev.target.value)} style={{background:"#1c2330",border:"1px solid #2a3444",borderRadius:8,color:"#e6edf3",padding:"8px 10px",fontFamily:"inherit",fontSize:"0.83rem",outline:"none"}}/>
+              <div style={{display:"flex",alignItems:"center",background:"#1c2330",border:"1px solid #2a3444",borderRadius:8,overflow:"hidden"}}>
+                <span style={{padding:"0 8px",color:"#8b949e",borderRight:"1px solid #2a3444",background:"#161b22",fontSize:"0.85rem"}}>$</span>
+                <input type="number" value={e.amount||""} onChange={ev=>updLeg(e.id,"amount",parseFloat(ev.target.value)||0)} placeholder="0" style={{background:"transparent",border:"none",color:"#e6edf3",padding:"8px 8px",fontFamily:"inherit",fontSize:"0.83rem",outline:"none",width:"100%"}}/>
+              </div>
+              <button onClick={()=>remLeg(e.id)} style={{width:32,height:32,borderRadius:6,border:"1px solid #2a3444",background:"transparent",color:"#f85149",cursor:"pointer",fontSize:"1rem"}}>×</button>
+            </div>
+          ))}
+          <button onClick={addLeg} style={{padding:"7px 14px",borderRadius:8,border:"1px dashed #a855f7",background:"transparent",color:"#a855f7",fontFamily:"inherit",fontSize:"0.8rem",cursor:"pointer"}}>+ Add Recipient</button>
+          {legacyFV>0&&<div style={{marginTop:10,background:"rgba(168,85,247,0.08)",border:"1px solid rgba(168,85,247,0.25)",borderRadius:8,padding:"10px 14px",fontSize:"0.82rem"}}>
+            <div style={{display:"flex",justifyContent:"space-between"}}><span style={{color:"#8b949e"}}>Legacy goal</span><strong style={{color:"#a855f7"}}>{fmtD(legacyFV)}</strong></div>
+          </div>}
+        </Panel>
+      </div>
+
+      <SecHeader>📊 Your Retirement Picture</SecHeader>
+      <div style={{background:"linear-gradient(135deg,#0f1820,#0d180d)",border:"1px solid rgba(201,168,76,0.35)",borderRadius:16,padding:"28px 28px 24px",marginBottom:20,display:"grid",gridTemplateColumns:"1fr auto",gap:20,alignItems:"center"}}>
+        <div>
+          <div style={{fontSize:"0.8rem",textTransform:"uppercase",letterSpacing:"0.12em",color:"#8b949e",marginBottom:8}}>You Need to Save Each Year</div>
+          <div style={{fontFamily:"'Playfair Display',serif",fontSize:"clamp(2.2rem,6vw,3.8rem)",fontWeight:900,color:"#e8c97a",lineHeight:1,marginBottom:6}}>
+            <CountUp value={Math.max(0,step4)}/>
+          </div>
+          <div style={{color:"#8b949e",fontSize:"0.87rem",marginBottom:18}}>per year for {ytr} years to build your {fmtD(step3)} nest egg</div>
+          <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+            {[{icon:"📅",label:"Per Month",val:fmtD(Math.max(0,step4/12))},{icon:"📊",label:"Savings Rate",val:fmtP(savRate),color:srColor},{icon:"🎯",label:"Nest Egg Goal",val:fmtD(step3)}].map(c=>(
+              <div key={c.label} style={{background:"rgba(255,255,255,0.04)",border:"1px solid #2a3444",borderRadius:10,padding:"8px 14px",minWidth:120}}>
+                <div style={{fontSize:"0.65rem",color:"#8b949e",textTransform:"uppercase",marginBottom:2}}>{c.icon} {c.label}</div>
+                <div style={{fontSize:"1rem",fontWeight:700,color:c.color||"#e6edf3"}}>{c.val}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+        <MoneyTree portfolioValue={combinedPV} targetAmount={step3}/>
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:14,marginBottom:20}}>
+        {[{pct:fundedPct,color:"#3fb950",label:"Funded",sub:"Portfolio vs. goal"},{pct:clamp(savRate,0,100),color:srColor,label:"Savings Rate",sub:"% of income needed"},{pct:clamp(ssCovPct,0,100),color:"#58a6ff",label:"SS Covers",sub:"Of annual need"},{pct:clamp((ytr/40)*100,0,100),color:"#c9a84c",label:"Time to Save",sub:"Years remaining"}].map((r,i)=>(
+          <div key={i} style={{background:"#161b22",border:"1px solid #2a3444",borderRadius:12,padding:"16px 10px",textAlign:"center"}}>
+            <ProgressRing pct={r.pct} color={r.color} label={r.label} sublabel={r.sub}/>
+          </div>
+        ))}
+      </div>
+
+      <Panel title="Portfolio Growth & Drawdown" emoji="📈">
+        <p style={{fontSize:"0.8rem",color:"#8b949e",marginBottom:14,lineHeight:1.5}}>
+          <span style={{color:"#3fb950",fontWeight:600}}>Green</span> = growing. <span style={{color:"#58a6ff",fontWeight:600}}>Blue</span> = spending down. <span style={{color:"#f0883e",fontWeight:600}}>Orange</span> = big purchases.{legacyFV>0&&<span> <span style={{color:"#a855f7",fontWeight:600}}>Purple</span> = your legacy floor.</span>}
+        </p>
+        <GrowthChart yearsToRetirement={ytr} yearsInRetirement={yir} annualSavings={Math.max(0,step4)} preReturn={preRetirementReturn} postReturn={postRetirementReturn} currentPortfolio={portfolioValue} step2Result={step2} currentAge={currentAge} legacyFV={legacyFV} realRate={realRate} bigPurchases={bigPurchases} inflation={inflation}/>
+      </Panel>
+
+      <Panel title="Where Your Income Comes From Each Year" emoji="🪣">
+        <SpendingBuckets ssAdjusted={ssAdj} totalNeed={Math.max(step1,0)}/>
+      </Panel>
+
+      <SecHeader>🔢 Step-by-Step Math</SecHeader>
+      {[
+        {step:1,emoji:"🧮",title:"Annual Income Need (Today's $)",plain:"What you'll spend each year in retirement, minus Social Security, adjusted for tax.",rows:[...(incomeMode==="direct"?[["Direct income entered",fmtD(directRetirementIncome),"n"]]:[[`Income × ${wageReplacementRatio}%`,fmtD(grossNeed),"n"]]),["− Social Security",`− ${fmtD(ssAdj)}`,"g"],[`${netDelta>=0?"+ Net expense increases":"− Net expense savings"}`,`${netDelta>=0?"+":"−"} ${fmtD(Math.abs(netDelta))}`,netDelta>=0?"r":"g"],...(taxToggle==="pre"?[["÷ Tax gross-up",`÷ ${(1-taxRate/100).toFixed(2)}`,"n"]]:[])],result:fmtD(step1),resultLabel:"Annual need (today's $)"},
+        {step:2,emoji:"⏩",title:"Inflation-Adjusted Annual Withdrawal",plain:`At ${inflation}% inflation over ${ytr} years, your annual need grows.`,rows:[["Annual need (Step 1)",fmtD(step1),"n"],["Inflation",`${inflation}%`,"n"],["Years",`${ytr}`,"n"]],result:fmtD(step2),resultLabel:"Annual withdrawal at retirement"},
+        {step:3,emoji:"🏔️",title:"Total Nest Egg Needed",plain:"Lump sum needed on retirement day to fund " + yir + " years of withdrawals" + (legacyFV>0?" plus "+fmtD(legacyFV)+" legacy":"") + (bigPurchases.filter(p=>p.amount>0).length>0?" plus "+bigPurchases.filter(p=>p.amount>0).length+" big purchase(s)":"") + ".",rows:[["PMT",fmtD(step2),"n"],["N",yir+" years","n"],["Real return",fmtP(realRate),"n"],...(legacyFV>0?[["Legacy FV",fmtD(legacyFV),"n"]]:[]),...(totalBPpv>0?[["Big purchases (PV total)",fmtD(totalBPpv),"r"]]:[])],result:fmtD(step3),resultLabel:"Nest egg goal"},
+        {step:4,emoji:"💪",title:"Required Annual Savings",plain:"How much to save per year, accounting for your existing portfolio.",accent:true,rows:[["Nest egg goal (Step 3)",fmtD(step3),"n"],["Existing savings",`− ${fmtD(portfolioValue)}`,"g"],...(inheritanceAmount>0?[["Inheritance PV",`− ${fmtD(pvInh)}`,"g"]]:[]),["Pre-retirement return",`${preRetirementReturn}%`,"n"],["Years",`${ytr}`,"n"]],result:fmtD(Math.max(0,step4)),resultLabel:"Annual savings required"},
+      ].map(s=>(
+        <div key={s.step} style={{background:"#161b22",border:`1px solid ${s.accent?"rgba(201,168,76,0.4)":"#2a3444"}`,borderRadius:12,marginBottom:14,overflow:"hidden"}}>
+          <div style={{background:s.accent?"rgba(201,168,76,0.08)":"#1c2330",padding:"14px 20px",display:"flex",alignItems:"center",gap:12}}>
+            <div style={{background:s.accent?"#c9a84c":"#2a3444",color:s.accent?"#0d1117":"#8b949e",borderRadius:"50%",width:26,height:26,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700,fontSize:"0.78rem",flexShrink:0}}>{s.step}</div>
+            <div style={{fontFamily:"'Playfair Display',serif",fontSize:"0.97rem",color:s.accent?"#e8c97a":"#e6edf3"}}>{s.emoji} {s.title}</div>
+          </div>
+          <div style={{padding:"14px 20px"}}>
+            <p style={{fontSize:"0.81rem",color:"#8b949e",marginBottom:14,lineHeight:1.55}}>{s.plain}</p>
+            {s.rows.filter(r=>r[1]).map(([l,v,c],i)=>(
+              <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"7px 0",borderBottom:"1px solid #1c2330",fontSize:"0.83rem"}}>
+                <span style={{color:"#6a7a8a"}}>{l}</span>
+                <span style={{fontWeight:600,color:c==="g"?"#3fb950":c==="r"?"#f85149":"#e6edf3"}}>{v}</span>
+              </div>
+            ))}
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:12,padding:"12px 16px",background:s.accent?"rgba(201,168,76,0.08)":"#0d1117",borderRadius:8,border:`1px solid ${s.accent?"rgba(201,168,76,0.3)":"#2a3444"}`}}>
+              <span style={{fontWeight:600,color:"#8b949e",fontSize:"0.82rem"}}>{s.resultLabel}</span>
+              <span style={{fontFamily:"'Playfair Display',serif",fontSize:"1.35rem",fontWeight:700,color:s.accent?"#e8c97a":"#e6edf3"}}>{s.result}</span>
+            </div>
+            {s.accent&&(
+              <div style={{display:"flex",gap:12,marginTop:12,flexWrap:"wrap"}}>
+                <div style={{flex:1,minWidth:120,background:"#0d1117",border:"1px solid #2a3444",borderRadius:8,padding:"10px 14px",textAlign:"center"}}>
+                  <div style={{fontSize:"0.65rem",color:"#8b949e",textTransform:"uppercase",marginBottom:3}}>📅 Per Month</div>
+                  <div style={{fontSize:"1.1rem",fontWeight:700,color:"#e6edf3"}}>{fmtD(Math.max(0,step4/12))}</div>
+                </div>
+                <div style={{flex:1,minWidth:120,background:"#0d1117",border:"1px solid #2a3444",borderRadius:8,padding:"10px 14px",textAlign:"center"}}>
+                  <div style={{fontSize:"0.65rem",color:"#8b949e",textTransform:"uppercase",marginBottom:3}}>📊 % of Income</div>
+                  <div style={{fontSize:"1.1rem",fontWeight:700,color:srColor}}>{fmtP(savRate)}</div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INVESTMENTS TAB
+// ══════════════════════════════════════════════════════════════════════════════
+function InvestmentsTab() {
+  const [quizStep,setQuizStep]=useState(0);
+  const [quizAnswers,setQuizAnswers]=useState([]);
+  const [profile,setProfile]=useState(null);
+  const [alloc,setAlloc]=useState(DEFAULT_ALLOC);
+  const [showExplainer,setShowExplainer]=useState(null);
+  const [holdings,setHoldings]=useState([
+    {id:1,ticker:"VTI",amount:10000,assetClass:"us"},
+    {id:2,ticker:"BND",amount:5000,assetClass:"bonds"},
+  ]);
+  const [mcYears,setMcYears]=useState(30);
+  const [mcPortfolio,setMcPortfolio]=useState(100000);
+  const [mcAnnualContrib,setMcAnnualContrib]=useState(10000);
+  const [mcAnnualWithdraw,setMcAnnualWithdraw]=useState(50000);
+  const [mcRetirementAge,setMcRetirementAge]=useState(65);
+  const [mcCurrentAge,setMcCurrentAge]=useState(35);
+  const [simResults,setSimResults]=useState(null);
+  const [simRunning,setSimRunning]=useState(false);
+  const [simDone,setSimDone]=useState(false);
+
+  const totalAlloc=Object.values(alloc).reduce((s,v)=>s+v,0);
+  const weightedReturn=ASSET_CLASSES.reduce((s,a)=>s+(alloc[a.key]/100)*a.ret,0);
+  const weightedVol=Math.sqrt(ASSET_CLASSES.reduce((s,a)=>s+Math.pow((alloc[a.key]/100)*a.vol,2),0));
+
+  const addHolding=()=>setHoldings(p=>[...p,{id:Date.now(),ticker:"",amount:0,assetClass:"us"}]);
+  const remHolding=id=>setHoldings(p=>p.filter(h=>h.id!==id));
+  const updHolding=(id,f,v)=>setHoldings(p=>p.map(h=>h.id===id?{...h,[f]:v}:h));
+  const totalHoldings=holdings.reduce((s,h)=>s+(parseFloat(h.amount)||0),0);
+
+  const setAllocKey=(key,val)=>{
+    const diff=val-alloc[key];
+    const others=Object.keys(alloc).filter(k=>k!==key);
+    const otherTotal=others.reduce((s,k)=>s+alloc[k],0);
+    const newAlloc={...alloc,[key]:val};
+    if(otherTotal>0) others.forEach(k=>{newAlloc[k]=Math.max(0,alloc[k]-diff*(alloc[k]/otherTotal));});
+    let rounded={}, sum=0;
+    others.forEach(k=>{rounded[k]=Math.round(newAlloc[k]*10)/10; sum+=rounded[k];});
+    rounded[key]=Math.round((100-sum)*10)/10;
+    setAlloc(rounded);
+  };
+
+  const acceptQuizAlloc=()=>{ if(profile) setAlloc({...profile.alloc}); };
+
+  const answerQuiz=(score)=>{
+    const newAns=[...quizAnswers,score];
+    setQuizAnswers(newAns);
+    if(quizStep>=QUIZ.length){
+      const total=newAns.reduce((s,v)=>s+v,0);
+      setProfile(riskProfile(total));
+      setQuizStep(QUIZ.length+1);
+    } else { setQuizStep(quizStep+1); }
+  };
+
+  const runMonteCarlo=useCallback(()=>{
+    setSimRunning(true); setSimDone(false);
+    setTimeout(()=>{
+      const N=5000;
+      const ytrMC=Math.max(mcRetirementAge-mcCurrentAge,1);
+      const totalYears=ytrMC+Math.max(mcYears,1);
+      const results=[];
+      for(let i=0;i<N;i++){
+        const path=[];
+        let bal=mcPortfolio;
+        for(let yr=0;yr<=totalYears;yr++){
+          path.push(Math.max(0,bal));
+          const annRet=randNormal(weightedReturn/100,weightedVol/100);
+          if(yr<ytrMC) bal=bal*(1+annRet)+mcAnnualContrib;
+          else bal=bal*(1+annRet)-mcAnnualWithdraw;
+        }
+        results.push(path);
+      }
+      setSimResults(results); setSimRunning(false); setSimDone(true);
+    },50);
+  },[mcPortfolio,mcAnnualContrib,mcAnnualWithdraw,mcRetirementAge,mcCurrentAge,mcYears,weightedReturn,weightedVol]);
+
+  const successRate=simResults?(simResults.filter(s=>s[s.length-1]>0).length/simResults.length)*100:null;
+  const totalYrsMC=Math.max(mcRetirementAge-mcCurrentAge,1)+Math.max(mcYears,1);
+  const pctAtEnd=pct=>{
+    if(!simResults)return 0;
+    const col=simResults.map(s=>s[s.length-1]).sort((a,b)=>a-b);
+    return col[Math.floor((pct/100)*(col.length-1))];
+  };
+  const medianAtRetirement=simResults?(()=>{
+    const col=simResults.map(s=>s[Math.min(Math.max(mcRetirementAge-mcCurrentAge,1),s.length-1)]).sort((a,b)=>a-b);
+    return col[Math.floor(0.5*(col.length-1))];
+  })():null;
+  const swr=medianAtRetirement?(mcAnnualWithdraw/medianAtRetirement)*100:null;
+
+  return (
+    <div style={{maxWidth:1100,margin:"0 auto",padding:"20px 16px 60px"}}>
+      <div style={{textAlign:"center",padding:"28px 0 20px"}}>
+        <div style={{fontSize:"2.4rem",marginBottom:8}}>📊</div>
+        <h2 style={{fontFamily:"'Playfair Display',serif",fontSize:"clamp(1.8rem,5vw,2.8rem)",fontWeight:900,background:"linear-gradient(135deg,#58a6ff,#3fb950,#e8c97a)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent",backgroundClip:"text",lineHeight:1.1,marginBottom:8}}>
+          Investment Analyzer
+        </h2>
+        <p style={{color:"#8b949e",fontSize:"0.9rem",maxWidth:480,margin:"0 auto"}}>Discover your risk profile, build your allocation, track holdings, and run Monte Carlo simulations.</p>
+      </div>
+
+      <SecHeader>🧠 Step 1 — Risk Profile Quiz</SecHeader>
+      {quizStep===0&&(
+        <Panel title="What Kind of Investor Are You?" emoji="🎯">
+          <p style={{color:"#8b949e",fontSize:"0.87rem",marginBottom:16,lineHeight:1.55}}>4 quick questions to find your investor personality and suggest the right asset mix.</p>
+          <button onClick={()=>setQuizStep(1)} style={{padding:"12px 28px",borderRadius:10,border:"1px solid #c9a84c",background:"rgba(201,168,76,0.1)",color:"#e8c97a",fontFamily:"inherit",fontSize:"0.92rem",fontWeight:700,cursor:"pointer"}}>🚀 Start Quiz</button>
+        </Panel>
+      )}
+      {quizStep>=1&&quizStep<=QUIZ.length&&(
+        <Panel title={`Question ${quizStep} of ${QUIZ.length}`} emoji="❓">
+          <p style={{fontSize:"1rem",color:"#e6edf3",fontWeight:600,marginBottom:20,lineHeight:1.5}}>{QUIZ[quizStep-1].q}</p>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(200px,1fr))",gap:10}}>
+            {QUIZ[quizStep-1].opts.map((opt,i)=>(
+              <button key={i} onClick={()=>answerQuiz(QUIZ[quizStep-1].scores[i])} style={{padding:"16px 12px",borderRadius:10,border:"1px solid #2a3444",background:"#1c2330",color:"#e6edf3",fontFamily:"inherit",fontSize:"0.87rem",cursor:"pointer",textAlign:"left",lineHeight:1.4}}>
+                {opt}
+              </button>
+            ))}
+          </div>
+          <div style={{display:"flex",gap:6,marginTop:18}}>
+            {QUIZ.map((_,i)=>(
+              <div key={i} style={{flex:1,height:3,borderRadius:2,background:i<quizStep-1?"#c9a84c":i===quizStep-1?"#e8c97a":"#2a3444",transition:"background 0.3s"}}/>
+            ))}
+          </div>
+        </Panel>
+      )}
+      {quizStep===QUIZ.length+1&&profile&&(
+        <Panel title="Your Investor Profile" emoji="🏆">
+          <div style={{display:"grid",gridTemplateColumns:"auto 1fr",gap:24,alignItems:"center"}}>
+            <div style={{textAlign:"center"}}>
+              <div style={{fontSize:"2.8rem",marginBottom:6}}>{profile.label==="Conservative"?"🛡️":profile.label==="Moderate"?"⚖️":profile.label==="Growth"?"📈":"🚀"}</div>
+              <div style={{fontFamily:"'Playfair Display',serif",fontSize:"1.3rem",fontWeight:700,color:profile.color}}>{profile.label}</div>
+            </div>
+            <div>
+              <p style={{color:"#8b949e",fontSize:"0.87rem",lineHeight:1.55,marginBottom:16}}>
+                {profile.label==="Conservative"&&"You prioritize stability over growth. You'd rather sleep well at night than chase big returns."}
+                {profile.label==="Moderate"&&"You want growth but don't love wild swings. A balanced blend of stocks and bonds suits you well."}
+                {profile.label==="Growth"&&"You're comfortable with volatility in exchange for higher long-term returns. Mostly equities, some bonds."}
+                {profile.label==="Aggressive"&&"You're in it for maximum growth. You can stomach significant short-term drops for long-term gains."}
+              </p>
+              <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+                <div style={{background:"#0d1117",border:"1px solid #2a3444",borderRadius:8,padding:"8px 14px",fontSize:"0.82rem"}}>
+                  <span style={{color:"#8b949e"}}>Suggested stocks: </span><strong style={{color:"#3fb950"}}>{profile.alloc.us+profile.alloc.intl+profile.alloc.em}%</strong>
+                </div>
+                <div style={{background:"#0d1117",border:"1px solid #2a3444",borderRadius:8,padding:"8px 14px",fontSize:"0.82rem"}}>
+                  <span style={{color:"#8b949e"}}>Suggested bonds: </span><strong style={{color:"#58a6ff"}}>{profile.alloc.bonds}%</strong>
+                </div>
+                <button onClick={acceptQuizAlloc} style={{padding:"8px 16px",borderRadius:8,border:"1px solid #3fb950",background:"rgba(63,185,80,0.1)",color:"#3fb950",fontFamily:"inherit",fontSize:"0.82rem",fontWeight:600,cursor:"pointer"}}>✅ Apply This Allocation</button>
+                <button onClick={()=>{setQuizStep(0);setQuizAnswers([]);setProfile(null);}} style={{padding:"8px 16px",borderRadius:8,border:"1px solid #2a3444",background:"transparent",color:"#8b949e",fontFamily:"inherit",fontSize:"0.82rem",cursor:"pointer"}}>🔄 Retake Quiz</button>
+              </div>
+            </div>
+          </div>
+        </Panel>
+      )}
+
+      <SecHeader>🥧 Step 2 — Asset Allocation</SecHeader>
+      <Panel title="Build Your Portfolio Mix" emoji="⚖️">
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:20}}>
+          <div>
+            {ASSET_CLASSES.map(ac=>(
+              <div key={ac.key} style={{marginBottom:18}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8}}>
+                    <span style={{fontSize:"0.85rem",color:"#e6edf3",fontWeight:500}}>{ac.label}</span>
+                    <button onClick={()=>setShowExplainer(showExplainer===ac.key?null:ac.key)} style={{background:"#2a3444",border:"none",color:"#8b949e",borderRadius:4,padding:"1px 6px",fontSize:"0.7rem",cursor:"pointer"}}>?</button>
+                  </div>
+                  <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                    <span style={{fontSize:"0.7rem",color:"#4a5568"}}>ret:{ac.ret}% vol:{ac.vol}%</span>
+                    <span style={{fontWeight:700,color:ac.color,minWidth:38,textAlign:"right"}}>{alloc[ac.key].toFixed(1)}%</span>
+                  </div>
+                </div>
+                {showExplainer===ac.key&&<div style={{background:"#0d1117",border:`1px solid ${ac.color}40`,borderRadius:6,padding:"7px 10px",fontSize:"0.76rem",color:"#8b949e",marginBottom:6,lineHeight:1.4}}>{ASSET_EXPLAINERS[ac.key]}</div>}
+                <input type="range" min={0} max={100} step={0.5} value={alloc[ac.key]} onChange={e=>setAllocKey(ac.key,parseFloat(e.target.value))} style={{width:"100%",accentColor:ac.color,cursor:"pointer"}}/>
+              </div>
+            ))}
+            <div style={{background:"#0d1117",borderRadius:8,padding:"10px 14px",fontSize:"0.82rem",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <span style={{color:Math.abs(totalAlloc-100)<0.5?"#3fb950":"#f85149",fontWeight:700}}>Total: {totalAlloc.toFixed(1)}%</span>
+              <span style={{color:"#8b949e"}}>Sliders auto-balance</span>
+            </div>
+          </div>
+          <div>
+            <div style={{marginBottom:16}}>
+              <div style={{fontSize:"0.75rem",color:"#8b949e",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>Your Mix</div>
+              <div style={{display:"flex",height:32,borderRadius:8,overflow:"hidden",border:"1px solid #2a3444"}}>
+                {ASSET_CLASSES.filter(ac=>alloc[ac.key]>0.5).map(ac=>(
+                  <div key={ac.key} style={{width:`${alloc[ac.key]}%`,background:ac.color,transition:"width 0.4s",display:"flex",alignItems:"center",justifyContent:"center",fontSize:"0.6rem",color:"#000",fontWeight:700,overflow:"hidden"}} title={`${ac.label}: ${alloc[ac.key].toFixed(1)}%`}>
+                    {alloc[ac.key]>8?`${alloc[ac.key].toFixed(0)}%`:""}
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:16}}>
+              {[{label:"📈 Weighted Return",val:fmtP(weightedReturn),color:"#3fb950"},{label:"〰️ Volatility",val:fmtP(weightedVol),color:"#f0883e"},{label:"⚡ Sharpe (approx)",val:fmt(Math.max(0,(weightedReturn-3)/weightedVol),2),color:"#e8c97a"},{label:"📐 Real Return (3% inf)",val:fmtP(weightedReturn-3),color:"#58a6ff"}].map(s=>(
+                <div key={s.label} style={{background:"#0d1117",border:"1px solid #2a3444",borderRadius:8,padding:"10px 12px"}}>
+                  <div style={{fontSize:"0.65rem",color:"#8b949e",textTransform:"uppercase",marginBottom:3}}>{s.label}</div>
+                  <div style={{fontSize:"1.05rem",fontWeight:700,color:s.color}}>{s.val}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}}>
+              {ASSET_CLASSES.map(ac=>(
+                <div key={ac.key} style={{display:"flex",alignItems:"center",gap:6,fontSize:"0.73rem",color:"#8b949e"}}>
+                  <div style={{width:10,height:10,borderRadius:2,background:ac.color,flexShrink:0}}/>
+                  {ac.label.replace(/^[^\s]+ /,"")} {alloc[ac.key].toFixed(1)}%
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </Panel>
+
+      <SecHeader>💼 Step 3 — Individual Holdings</SecHeader>
+      <Panel title="Enter Your Holdings" emoji="📋">
+        <p style={{fontSize:"0.82rem",color:"#8b949e",marginBottom:14,lineHeight:1.5}}>Enter tickers and dollar values. We'll assign the expected return for each asset class.</p>
+        <div style={{display:"grid",gridTemplateColumns:"100px 1fr 160px 32px",gap:8,marginBottom:6}}>
+          {["Ticker","Amount ($)","Asset Class",""].map(h=><span key={h} style={{fontSize:"0.65rem",color:"#4a5568",textTransform:"uppercase"}}>{h}</span>)}
+        </div>
+        {holdings.map(h=>(
+          <div key={h.id} style={{display:"grid",gridTemplateColumns:"100px 1fr 160px 32px",gap:8,marginBottom:8,alignItems:"center"}}>
+            <input type="text" placeholder="VTI" value={h.ticker} onChange={e=>updHolding(h.id,"ticker",e.target.value.toUpperCase())} style={{background:"#1c2330",border:"1px solid #2a3444",borderRadius:8,color:"#e6edf3",padding:"8px 10px",fontFamily:"monospace",fontSize:"0.87rem",outline:"none"}}/>
+            <input type="number" value={h.amount||""} onChange={e=>updHolding(h.id,"amount",parseFloat(e.target.value)||0)} placeholder="0" style={{background:"#1c2330",border:"1px solid #2a3444",borderRadius:8,color:"#e6edf3",padding:"8px 10px",fontFamily:"inherit",fontSize:"0.87rem",outline:"none"}}/>
+            <select value={h.assetClass} onChange={e=>updHolding(h.id,"assetClass",e.target.value)} style={{background:"#1c2330",border:"1px solid #2a3444",borderRadius:8,color:"#e6edf3",padding:"8px 8px",fontFamily:"inherit",fontSize:"0.78rem",outline:"none"}}>
+              {ASSET_CLASSES.map(ac=><option key={ac.key} value={ac.key}>{ac.label}</option>)}
+            </select>
+            <button onClick={()=>remHolding(h.id)} style={{width:32,height:32,borderRadius:6,border:"1px solid #2a3444",background:"transparent",color:"#f85149",cursor:"pointer",fontSize:"1rem"}}>×</button>
+          </div>
+        ))}
+        <button onClick={addHolding} style={{padding:"7px 14px",borderRadius:8,border:"1px dashed #2a3444",background:"transparent",color:"#8b949e",fontFamily:"inherit",fontSize:"0.8rem",cursor:"pointer",marginTop:4,marginBottom:16}}>+ Add Holding</button>
+        {totalHoldings>0&&(
+          <>
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
+              <span style={{fontSize:"0.8rem",color:"#8b949e"}}>Portfolio breakdown by asset class</span>
+              <span style={{fontSize:"0.87rem",fontWeight:700,color:"#e8c97a"}}>{fmtD(totalHoldings)}</span>
+            </div>
+            <div style={{display:"flex",height:28,borderRadius:8,overflow:"hidden",border:"1px solid #2a3444",marginBottom:10}}>
+              {ASSET_CLASSES.map(ac=>{
+                const tot=holdings.filter(h=>h.assetClass===ac.key).reduce((s,h)=>s+(h.amount||0),0);
+                const pct=(tot/totalHoldings)*100;
+                return pct>0.5?<div key={ac.key} style={{width:`${pct}%`,background:ac.color,display:"flex",alignItems:"center",justifyContent:"center",fontSize:"0.6rem",color:"#000",fontWeight:700,transition:"width 0.4s"}} title={`${ac.label}: ${fmtD(tot)} (${pct.toFixed(1)}%)`}>{pct>8?`${pct.toFixed(0)}%`:""}</div>:null;
+              })}
+            </div>
+          </>
+        )}
+      </Panel>
+
+      <SecHeader>🎲 Step 4 — Monte Carlo Simulation</SecHeader>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(320px,1fr))",gap:18,marginBottom:18}}>
+        <Panel title="Simulation Parameters" emoji="⚙️">
+          <div style={{background:"rgba(63,185,80,0.06)",border:"1px solid rgba(63,185,80,0.2)",borderRadius:8,padding:"10px 14px",fontSize:"0.8rem",color:"#8b949e",marginBottom:16,lineHeight:1.5}}>
+            Using your allocation: <strong style={{color:"#3fb950"}}>Mean {fmtP(weightedReturn)}</strong>, <strong style={{color:"#f0883e"}}>Std Dev {fmtP(weightedVol)}</strong>. 5,000 simulations.
+          </div>
+          <SliderInput emoji="🎂" label="Current Age" value={mcCurrentAge} onChange={v=>v<mcRetirementAge&&setMcCurrentAge(v)} min={20} max={65} format={v=>`Age ${v}`}/>
+          <SliderInput emoji="🏖️" label="Retirement Age" value={mcRetirementAge} onChange={v=>v>mcCurrentAge&&setMcRetirementAge(v)} min={50} max={75} format={v=>`Age ${v}`}/>
+          <SliderInput emoji="⌛" label="Years in Retirement" value={mcYears} onChange={setMcYears} min={10} max={40} format={v=>`${v} yrs`}/>
+          <NumberInput emoji="💼" label="Current Portfolio Value" value={mcPortfolio} onChange={setMcPortfolio}/>
+          <NumberInput emoji="💰" label="Annual Contribution (working)" value={mcAnnualContrib} onChange={setMcAnnualContrib}/>
+          <NumberInput emoji="💸" label="Annual Withdrawal (retirement)" value={mcAnnualWithdraw} onChange={setMcAnnualWithdraw}/>
+          <button onClick={runMonteCarlo} disabled={simRunning} style={{width:"100%",padding:"14px",borderRadius:10,border:"1px solid #c9a84c",background:"linear-gradient(135deg,rgba(201,168,76,0.2),rgba(201,168,76,0.05))",color:"#e8c97a",fontFamily:"inherit",fontSize:"1rem",fontWeight:700,cursor:simRunning?"wait":"pointer",marginTop:6}}>
+            {simRunning?"⏳ Running 5,000 simulations…":"🎲 Run Monte Carlo Simulation"}
+          </button>
+        </Panel>
+        {simDone&&successRate!==null&&(
+          <Panel title="Results" emoji="📊">
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:16}}>
+              <div style={{gridColumn:"1/-1",display:"flex",justifyContent:"center"}}><SuccessGauge pct={successRate}/></div>
+              {[{label:"10th Percentile",val:fmtD(pctAtEnd(10)),color:"#f85149"},{label:"25th Percentile",val:fmtD(pctAtEnd(25)),color:"#f0883e"},{label:"Median (50th)",val:fmtD(pctAtEnd(50)),color:"#3fb950"},{label:"75th Percentile",val:fmtD(pctAtEnd(75)),color:"#58a6ff"},{label:"90th Percentile",val:fmtD(pctAtEnd(90)),color:"#a371f7"},{label:"Median at Retire",val:fmtD(medianAtRetirement),color:"#e8c97a"}].map(s=>(
+                <div key={s.label} style={{background:"#0d1117",border:"1px solid #2a3444",borderRadius:8,padding:"10px 12px"}}>
+                  <div style={{fontSize:"0.65rem",color:"#8b949e",textTransform:"uppercase",marginBottom:3}}>{s.label}</div>
+                  <div style={{fontSize:"0.95rem",fontWeight:700,color:s.color}}>{s.val}</div>
+                </div>
+              ))}
+            </div>
+            {swr!==null&&(
+              <div style={{background:swr<=4?"rgba(63,185,80,0.1)":swr<=5?"rgba(232,201,122,0.1)":"rgba(248,81,73,0.1)",border:`1px solid ${swr<=4?"rgba(63,185,80,0.35)":swr<=5?"rgba(232,201,122,0.35)":"rgba(248,81,73,0.35)"}`,borderRadius:8,padding:"10px 14px"}}>
+                <div style={{fontSize:"0.75rem",color:"#8b949e",marginBottom:4}}>WITHDRAWAL RATE vs. MEDIAN NEST EGG</div>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                  <span style={{fontWeight:700,color:"#e6edf3",fontSize:"1.1rem"}}>{fmtP(swr)}</span>
+                  <span style={{fontSize:"0.78rem",color:swr<=4?"#3fb950":swr<=5?"#e8c97a":"#f85149",fontWeight:600}}>
+                    {swr<=4?"✅ Below 4% rule — sustainable!":swr<=5?"⚠️ Near the safe zone edge":"🔴 Above 4% rule — review plan"}
+                  </span>
+                </div>
+              </div>
+            )}
+          </Panel>
+        )}
+      </div>
+      {simDone&&simResults&&(
+        <Panel title="Fan Chart — Range of Portfolio Outcomes" emoji="📈">
+          <p style={{fontSize:"0.8rem",color:"#8b949e",marginBottom:14,lineHeight:1.5}}>
+            The <strong style={{color:"#3fb950"}}>green bands</strong> show the spread of 5,000 possible futures. The line is your median path.
+          </p>
+          <FanChart simResults={simResults} years={totalYrsMC} currentAge={mcCurrentAge} retirementAge={mcRetirementAge} yearsToRetirement={Math.max(mcRetirementAge-mcCurrentAge,1)} mode="combined"/>
+        </Panel>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ROOT APP
+// ══════════════════════════════════════════════════════════════════════════════
+export default function App() {
+  const [tab,setTab]=useState("retirement");
+  return (
+    <>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;700;900&family=DM+Sans:wght@300;400;500;600&display=swap');
+        *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+        body{background:#0d1117;color:#e6edf3;font-family:'DM Sans',sans-serif;line-height:1.5}
+        input[type=number]::-webkit-inner-spin-button{opacity:.3}
+        @keyframes coinFloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-7px)}}
+      `}</style>
+      <div style={{position:"sticky",top:0,zIndex:100,background:"rgba(13,17,23,0.95)",backdropFilter:"blur(12px)",borderBottom:"1px solid #2a3444"}}>
+        <div style={{maxWidth:1100,margin:"0 auto",padding:"0 16px",display:"flex",alignItems:"center",gap:24,height:56}}>
+          <div style={{fontFamily:"'Playfair Display',serif",fontWeight:700,color:"#c9a84c",fontSize:"1.05rem",letterSpacing:"0.02em",whiteSpace:"nowrap"}}>🌱 RetireWise</div>
+          <div style={{display:"flex",gap:4,flex:1}}>
+            {[{val:"retirement",label:"📊 Retirement Planner"},{val:"investments",label:"💼 Investments"}].map(t=>(
+              <button key={t.val} onClick={()=>setTab(t.val)} style={{padding:"8px 18px",borderRadius:8,border:"none",background:tab===t.val?"rgba(201,168,76,0.15)":"transparent",color:tab===t.val?"#e8c97a":"#8b949e",fontFamily:"inherit",fontSize:"0.87rem",fontWeight:tab===t.val?700:400,cursor:"pointer",transition:"all 0.15s",position:"relative"}}>
+                {t.label}
+                {tab===t.val&&<div style={{position:"absolute",bottom:0,left:"50%",transform:"translateX(-50%)",width:"60%",height:2,background:"#c9a84c",borderRadius:1}}/>}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+      <div style={{minHeight:"100vh",background:"#0d1117"}}>
+        {tab==="retirement"&&<RetirementTab/>}
+        {tab==="investments"&&<InvestmentsTab/>}
+      </div>
+    </>
+  );
+}
